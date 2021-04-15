@@ -1,16 +1,17 @@
-# 
+#!/usr/bin/env python
 
 import nltk
 import math, base64, pickle
 import numpy as np
 from collections import Counter
 from nltk.stem.porter import PorterStemmer
+import argparse
 
 
 EPSILON = 1e-10
 
 class ClarityScore(object):
-		#https://www.nltk.org/_modules/nltk/tokenize.html#word_tokenize
+	#https://www.nltk.org/_modules/nltk/tokenize.html#word_tokenize
 	__internal_tokenize = nltk.tokenize.word_tokenize
 	__internal_stemmer = PorterStemmer()
 
@@ -211,3 +212,31 @@ class ClarityScore(object):
 		cs.collection_filepath = obj_dict["collection_filepath"]
 		cs.collection_language_model = obj_dict["collection_language_model"]
 		return cs
+
+
+def main():
+	parser = argparse.ArgumentParser()
+	parser.add_argument('-q', '--query', required=True)
+
+	group = parser.add_mutually_exclusive_group(required=True)
+	group.add_argument('-L', '--collection_filepath')
+	group.add_argument('-A', '--cache_input_filepath')
+
+	parser.add_argument('-r', '--retrieval_filepath')
+	parser.add_argument('-o', '--cache_output_filepath', required=False)
+	parser.add_argument('--smoothing', default=0.6, type=float, required=False)
+	args = parser.parse_args()
+
+	if args.collection_filepath is not None:
+		clarity_score = ClarityScore(args.collection_filepath, smoothing_constant=args.smoothing)
+	else:
+		clarity_score = ClarityScore.restore(args.cache_input_filepath)
+
+	if args.cache_output_filepath is not None:
+		clarity_score.save(args.cache_output_filepath)
+
+	print("clarity score: %f" % clarity_score(args.query, args.retrieval_filepath))
+
+
+if __name__ == "__main__":
+	main()
