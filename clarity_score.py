@@ -26,7 +26,8 @@ class ClarityScore(object):
 		if collection_filepath is not None:
 			self.collection_filepath = collection_filepath
 			self.collection_language_model = \
-					self.gen_language_model(ClarityScore._parse_docfile(self.collection_filepath))
+					self.gen_language_model(ClarityScore._parse_docfile(self.collection_filepath),
+											desc="Collection LM")
 		else:
 			self.collection_filepath = None
 			self.collection_language_model = None
@@ -53,38 +54,66 @@ class ClarityScore(object):
 
 	# Get term counts for a specific document
 	@staticmethod
-	def _file_token_counts(filepath, stem):
+	def _file_token_counts(filepath_stem_pair):
+		filepath, stem = filepath_stem_pair
 		with open(filepath, errors='backslashreplace') as fh:
 			try:
 				unigrams = ClarityScore._tokenize(fh.read(), stem)
 			except Exception as e:
 				print("Error encountered when parsing %s" % filepath)
 				raise e
-		print("Finished tokenizing %s" % filepath)
+		#print("Finished tokenizing %s" % filepath)
 		return Counter(unigrams)
 
-	def gen_language_model(self, document_filepaths, stem_tokens=True):
+	@staticmethod
+	def _counter_add(counter_pair):
+		c1, c2 = counter_pair
+		return c1 + c2
+
+	def gen_language_model(self, document_filepaths, stem_tokens=True, desc="LM"):
 		#print("gen_language_model:", document_filepaths, stem_tokens)
 
-		# Get term counts for all documents specified
+		def merge_counters(map_func, counters):
+			# Create progress logging utilities
+			task_tqdm = tqdm.tqdm(total=len(document_counters) - 1, desc="%s Counter Accumulation" % desc)
+			def update_tqdm_callback(arg):
+				task_tqdm.update()
+				return arg
+
+			# Pair up counters to be summed
+			half_len = len(counters) // 2
+			unsummed_counters = counters[2 * half_len:]
+			counter_pairs = list(zip(counters[:half_len], counters[half_len:2 * half_len]))
+			while len(counter_pairs) > 0:
+				# Sum pairs and generate a new list of counters to be summed
+				counters = list(map(update_tqdm_callback, map_func(ClarityScore._counter_add, counter_pairs))) + \
+						   unsummed_counters
+				# Pair up counters to be summed
+				half_len = len(counters) // 2
+				unsummed_counters = counters[2 * half_len:]
+				counter_pairs = list(zip(counters[:half_len], counters[half_len:2 * half_len]))
+			return unsummed_counters[0]
+
+		# Get term count for each document in collection
 		workers = min(self.workers, len(document_filepaths))
+		tokenizing_desc = "%s Document Tokenizing" % desc
 		if workers > 1:
 			with multiprocessing.Pool(workers) as pool:
-				document_counters = pool.starmap(ClarityScore._file_token_counts, \
-						[(d, stem_tokens) for d in document_filepaths])
-		else:
-			document_counters = [ClarityScore._file_token_counts(f, stem_tokens) \
-					for f in tqdm.tqdm(document_filepaths)]
+				document_counters = list(tqdm.tqdm(pool.imap(ClarityScore._file_token_counts,
+							[(d, stem_tokens) for d in document_filepaths]),
+						total=len(document_filepaths), desc=tokenizing_desc))
 
-		# Sum term counts from each counter
-		counter = Counter()
-		while len(document_counters) > 0:
-			counter += document_counters.pop()
+			with multiprocessing.Pool(workers) as pool:
+				counter = merge_counters(pool.imap, document_counters)
+		else:
+			document_counters = [ClarityScore._file_token_counts((f, stem_tokens)) \
+					for f in tqdm.tqdm(document_filepaths, desc=tokenizing_desc)]
+			counter = merge_counters(map, document_counters)
 
 		# Generate probability distribution from counts by dividing counts
 		# by total number of terms
 		term_count = float(sum(counter.values()))
-		for term in counter.keys():
+		for term in tqdm.tqdm(counter.keys(), desc="%s Count Normalization" % desc):
 			counter[term] /= term_count
 		assert(1. - EPSILON <= sum(counter.values()) <= 1. + EPSILON)
 		return counter
@@ -96,7 +125,7 @@ class ClarityScore(object):
 		# Generate lanuage model for each document listed in docfile
 		document_language_models = []
 		for filepath in ClarityScore._parse_docfile(docfile_filepath):
-			document_language_models.append(self.gen_language_model([filepath]))
+			document_language_models.append(self.gen_language_model([filepath], desc="Document LM"))
 		#print("document_language_models=", document_language_models)
 
 		# Tokenize query
