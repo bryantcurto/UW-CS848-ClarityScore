@@ -3,6 +3,7 @@
 import nltk
 import math, base64, pickle
 import numpy as np
+import multiprocessing
 from collections import Counter
 from nltk.stem.porter import PorterStemmer
 import argparse
@@ -16,8 +17,9 @@ class ClarityScore(object):
 	__internal_stemmer = PorterStemmer()
 
 
-	def __init__(self, collection_filepath, smoothing_constant=0.6):
+	def __init__(self, collection_filepath, smoothing_constant=0.6, workers=8):
 		self.smoothing_constant = smoothing_constant
+		self.workers = workers
 
 		# I only really want restore passing None to constructor
 		if collection_filepath is not None:
@@ -29,7 +31,8 @@ class ClarityScore(object):
 			self.collection_language_model = None
 
 
-	def _tokenize(self, text, stem_tokens=True):
+	@staticmethod
+	def _tokenize(text, stem_tokens=True):
 		tokens = ClarityScore.__internal_tokenize(text)
 		if stem_tokens:
 			# Stem tokens, checking for and removing empty strings just in case
@@ -47,20 +50,33 @@ class ClarityScore(object):
 		#unigrams = nltk.ngrams(tokens, 1)
 		return tokens
 
+	# Get term counts for a specific document
+	@staticmethod
+	def _file_token_counts(filepath, stem):
+		with open(filepath, errors='backslashreplace') as fh:
+			try:
+				unigrams = ClarityScore._tokenize(fh.read(), stem)
+			except Exception as e:
+				print("Error encountered when parsing %s" % filepath)
+				raise e
+		return Counter(unigrams)
 
 	def gen_language_model(self, document_filepaths, stem_tokens=True):
 		#print("gen_language_model:", document_filepaths, stem_tokens)
 
+
 		# Get term counts for all documents specified
+		if self.workers > 1:
+			with multiprocessing.Pool(self.workers) as pool:
+				document_counters = pool.starmap(ClarityScore._file_token_counts, \
+						[(d, stem_tokens) for d in document_filepaths])
+		else:
+			document_counters = [ClarityScore._file_token_counts(f, stem_tokens) for f in document_filepaths]
+
+		# Sum term counts from each counter
 		counter = Counter()
-		for filepath in document_filepaths:
-			with open(filepath, errors='backslashreplace') as fh:
-				try:
-					unigrams = self._tokenize(fh.read(), stem_tokens)
-				except Exception as e:
-					print("Error encountered when parsing %s" % filepath)
-					raise e
-			counter += Counter(unigrams)
+		while len(document_counters) > 0:
+			counter += document_counters.pop()
 
 		# Generate probability distribution from counts by dividing counts
 		# by total number of terms
@@ -84,6 +100,9 @@ class ClarityScore(object):
 		query_terms = self._tokenize(query)
 		#print("query_terms=", query_terms)
 
+		# Precompute some values used for computing each of P(w|Q)
+		values_for_P_of_w_given_Q = self._values_for_P_of_w_given_Q(query_terms, document_language_models)
+
 		# Compute clarity score term by term
 		#   clarity score = \sum_{w \in V} P(w|Q) log2( P(w|Q) / P_{coll}(w) )
 		#     w: term, V: entire vocabulary of collection, Q: query,
@@ -91,7 +110,7 @@ class ClarityScore(object):
 		#     P_{coll}(w): collection language model function,
 		clarity_score = 0.
 		for w in self.collection_language_model.keys():
-			P_of_w_given_Q = self._P_of_w_given_Q(w, query_terms, document_language_models)
+			P_of_w_given_Q = self._P_of_w_given_Q(w, document_language_models, *values_for_P_of_w_given_Q)
 			P_coll_of_w = self._term_frequency(w, self.collection_language_model)
 			term_contribution = P_of_w_given_Q * math.log2(P_of_w_given_Q / P_coll_of_w)
 			clarity_score += term_contribution
@@ -104,9 +123,7 @@ class ClarityScore(object):
 		return clarity_score
 
 
-	def _P_of_w_given_Q(self, w, query_terms, document_language_models):
-		#print("_P_of_w_given_Q:", '"'+w+'"', query_terms, document_language_models)
-
+	def _values_for_P_of_w_given_Q(self, query_terms, document_language_models):
 		# Precompute [P(Q|D) P(D)]s for each document for computation of P(D|Q)
 		# 1) Compute priors, P(D)s
 		priors = np.array([0.] * len(document_language_models))
@@ -125,12 +142,26 @@ class ClarityScore(object):
 		#print("P(Q|D) list -", P_of_Q_given_D_list)
 
 		# 3) Compute [P(Q|D) P(D)]s
-		P_of_D_given_Q_term_list = [v1 * v2 for (v1, v2) in zip(P_of_Q_given_D_list, priors)]
-		#print("P(Q|D) P(D) list -", P_of_D_given_Q_term_list)
+		P_of_D_given_Q_list = [v1 * v2 for (v1, v2) in zip(P_of_Q_given_D_list, priors)]
+		#print("P(Q|D) P(D) list -", P_of_D_given_Q_list)
 
 		# 4) Compute sum of [P(Q|D) P(D)]s
-		P_of_D_given_Q_term_sum = sum(P_of_D_given_Q_term_list)
-		#print("[P(Q|D) P(D)]s sum -", P_of_D_given_Q_term_sum)
+		P_of_D_given_Q_sum = sum(P_of_D_given_Q_list)
+		#print("[P(Q|D) P(D)]s sum -", P_of_D_given_Q_sum)
+
+		return (P_of_D_given_Q_list, P_of_D_given_Q_sum)
+
+
+	def _P_of_Q_given_D(self, query_terms, document_language_model):
+		# P(Q|D) = \prod_{w \in Q} P(w|D)
+		P_of_Q_given_D = 1.
+		for term in query_terms:
+			P_of_Q_given_D *= self._term_frequency(term, document_language_model)
+		return P_of_Q_given_D
+
+
+	def _P_of_w_given_Q(self, w, document_language_models, P_of_D_given_Q_list, P_of_D_given_Q_sum):
+		#print("_P_of_w_given_Q:", '"'+w+'"', query_terms, document_language_models)
 
 		# Estimate query language model function at term w, P(w|Q), term by term
 		#   P(w|Q) = \sum_{D \in R} P(w|D) P(D|Q)
@@ -140,7 +171,7 @@ class ClarityScore(object):
 		#     P(w|D): frequency of term w in document D,
 		#     P(D|Q): probability of document D given query Q
 		probability = 0.
-		for i, document_language_model in enumerate(document_language_models):
+		for i, (P_of_D_given_Q, document_language_model) in enumerate(zip(P_of_D_given_Q_list, document_language_models)):
 			#print("Document %d P(\"%s\"|Q)" % (i, w))
 
 			# Compute P(w|D)
@@ -156,7 +187,7 @@ class ClarityScore(object):
 			#            \sum_{D' \in R} P(Q|D') P(D')
 			#
 			# see Estimating the Query Difficulty for Information Retrieval
-			P_of_D_given_Q = P_of_D_given_Q_term_list[i] / P_of_D_given_Q_term_sum
+			P_of_D_given_Q = P_of_D_given_Q / P_of_D_given_Q_sum
 			#print("    P(D_%d|Q)=%f" % (i, P_of_D_given_Q))
 
 			term_contribution = P_of_w_given_D * P_of_D_given_Q
@@ -164,14 +195,6 @@ class ClarityScore(object):
 
 			probability += term_contribution
 		return probability
-
-
-	def _P_of_Q_given_D(self, query_terms, document_language_model):
-		# P(Q|D) = \prod_{w \in Q} P(w|D)
-		P_of_Q_given_D = 1.
-		for term in query_terms:
-			P_of_Q_given_D *= self._term_frequency(term, document_language_model)
-		return P_of_Q_given_D
 
 
 	def _term_frequency(self, w, language_model):
@@ -225,12 +248,14 @@ def main():
 	parser.add_argument('-r', '--retrieval_filepath')
 	parser.add_argument('-o', '--cache_output_filepath', required=False)
 	parser.add_argument('--smoothing', default=0.6, type=float, required=False)
+	parser.add_argument('--workers', default=8, type=int, required=False)
 	args = parser.parse_args()
 
 	if args.collection_filepath is not None:
-		clarity_score = ClarityScore(args.collection_filepath, smoothing_constant=args.smoothing)
+		clarity_score = ClarityScore(args.collection_filepath, smoothing_constant=args.smoothing, workers=args.workers)
 	else:
 		clarity_score = ClarityScore.restore(args.cache_input_filepath)
+		clarity_score.workers = args.workers
 
 	if args.cache_output_filepath is not None:
 		clarity_score.save(args.cache_output_filepath)
