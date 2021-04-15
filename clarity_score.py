@@ -7,6 +7,7 @@ import multiprocessing
 from collections import Counter
 from nltk.stem.porter import PorterStemmer
 import argparse
+import tqdm
 
 
 EPSILON = 1e-10
@@ -59,19 +60,21 @@ class ClarityScore(object):
 			except Exception as e:
 				print("Error encountered when parsing %s" % filepath)
 				raise e
+		print("Finished tokenizing %s" % filepath)
 		return Counter(unigrams)
 
 	def gen_language_model(self, document_filepaths, stem_tokens=True):
 		#print("gen_language_model:", document_filepaths, stem_tokens)
 
-
 		# Get term counts for all documents specified
-		if self.workers > 1:
-			with multiprocessing.Pool(self.workers) as pool:
+		workers = min(self.workers, len(document_filepaths))
+		if workers > 1:
+			with multiprocessing.Pool(workers) as pool:
 				document_counters = pool.starmap(ClarityScore._file_token_counts, \
 						[(d, stem_tokens) for d in document_filepaths])
 		else:
-			document_counters = [ClarityScore._file_token_counts(f, stem_tokens) for f in document_filepaths]
+			document_counters = [ClarityScore._file_token_counts(f, stem_tokens) \
+					for f in tqdm.tqdm(document_filepaths)]
 
 		# Sum term counts from each counter
 		counter = Counter()
@@ -109,10 +112,13 @@ class ClarityScore(object):
 		#     P(w|Q): query language model function,
 		#     P_{coll}(w): collection language model function,
 		clarity_score = 0.
-		for w in self.collection_language_model.keys():
+		term_info = {}
+		for w in tqdm.tqdm(self.collection_language_model.keys()):
 			P_of_w_given_Q = self._P_of_w_given_Q(w, document_language_models, *values_for_P_of_w_given_Q)
 			P_coll_of_w = self._term_frequency(w, self.collection_language_model)
 			term_contribution = P_of_w_given_Q * math.log2(P_of_w_given_Q / P_coll_of_w)
+
+			term_info[w] = (term_contribution, math.log2(P_of_w_given_Q), math.log2(P_coll_of_w))
 			clarity_score += term_contribution
 
 			#print("Clarity Score Term \"%s\" Contribution:" %(w))
@@ -120,7 +126,7 @@ class ClarityScore(object):
 			#print("    log2(P_{coll}(%s))=%f" % (w, math.log2(P_coll_of_w)))
 			#print("  P(\"%s\"|Q) log2( P(\"%s\"|Q) / P_{coll}(%s)) =%f" % (w, w, w, term_contribution))
 			#print("")
-		return clarity_score
+		return clarity_score, term_info
 
 
 	def _values_for_P_of_w_given_Q(self, query_terms, document_language_models):
@@ -249,18 +255,24 @@ def main():
 	parser.add_argument('-o', '--cache_output_filepath', required=False)
 	parser.add_argument('--smoothing', default=0.6, type=float, required=False)
 	parser.add_argument('--workers', default=8, type=int, required=False)
+	parser.add_argument('--max_top_terms', default=5, type=int, required=False)
 	args = parser.parse_args()
 
 	if args.collection_filepath is not None:
-		clarity_score = ClarityScore(args.collection_filepath, smoothing_constant=args.smoothing, workers=args.workers)
+		cs = ClarityScore(args.collection_filepath, smoothing_constant=args.smoothing, workers=args.workers)
 	else:
-		clarity_score = ClarityScore.restore(args.cache_input_filepath)
-		clarity_score.workers = args.workers
+		cs = ClarityScore.restore(args.cache_input_filepath)
+		cs.workers = args.workers
 
 	if args.cache_output_filepath is not None:
-		clarity_score.save(args.cache_output_filepath)
+		cs.save(args.cache_output_filepath)
 
-	print("clarity score: %f" % clarity_score(args.query, args.retrieval_filepath))
+	clarity_score, term_info = cs(args.query, args.retrieval_filepath)
+	print("Clarity Score: %f" % clarity_score)
+	print("Top Contributing Terms:")
+	top_contributing_terms = sorted(term_info.items(), key=lambda v: -v[1][0])[:min(args.max_top_terms, len(term_info))]
+	for term, (term_contribution, log2_P_of_w_given_Q, log2_P_coll_of_w) in top_contributing_terms:
+		print("  %s: %f" % (str(term), term_contribution))
 
 
 if __name__ == "__main__":
