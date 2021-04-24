@@ -1,23 +1,20 @@
 #!/usr/bin/env python
 
+import sys, os
 import nltk
 import math, base64, pickle
 import numpy as np
 import multiprocessing
 from collections import Counter
-from nltk.stem.porter import PorterStemmer
 import argparse
 import tqdm
+import subprocess
 
-
+LINES_CHUNK_SIZE=1000
+CLARITY_SCORE_TERM_CONTRIB_CHUNK_SIZE = 10000
 EPSILON = 1e-10
 
 class ClarityScore(object):
-	#https://www.nltk.org/_modules/nltk/tokenize.html#word_tokenize
-	__internal_tokenize = nltk.tokenize.word_tokenize
-	__internal_stemmer = PorterStemmer()
-
-
 	def __init__(self, collection_filepath, smoothing_constant=0.6, workers=8):
 		self.smoothing_constant = smoothing_constant
 		self.workers = workers
@@ -26,136 +23,210 @@ class ClarityScore(object):
 		if collection_filepath is not None:
 			self.collection_filepath = collection_filepath
 			self.collection_language_model = \
-					self.gen_language_model(ClarityScore._parse_docfile(self.collection_filepath),
-											desc="Collection LM")
+					ClarityScore.gen_language_model((self.collection_filepath, self.workers, "Collection LM"))
 		else:
 			self.collection_filepath = None
 			self.collection_language_model = None
 
+	@staticmethod
+	def _stem_terms(terms):
+		proc = subprocess.Popen(args=["handyman", "STEMMING"], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=1, universal_newlines=True)
+		for term in terms:
+			term = term.lower()
+			proc.stdin.write(term + '\n')
+		stemmed_terms = proc.communicate()[0].split('\n')[:-1]
+		assert(len(stemmed_terms) == len(terms))
+		return stemmed_terms
 
 	@staticmethod
-	def _tokenize(text, stem_tokens=True):
-		tokens = ClarityScore.__internal_tokenize(text)
-		if stem_tokens:
-			# Stem tokens, checking for and removing empty strings just in case
-			# Let's do this in pace to reduce memory working set size
-			next_slot_idx = 0
-			for cur_elem_idx in range(len(tokens)):
-				stemmed_token = ClarityScore.__internal_stemmer.stem(tokens[cur_elem_idx])
-				if '' != stemmed_token:
-					tokens[next_slot_idx] = stemmed_token
-					next_slot_idx += 1
-			if len(tokens) > next_slot_idx:
-				print("Removed %d empty-strings generated from stemming" % \
-					  (len(tokens) - next_slot_idx))
-			tokens = tokens[:next_slot_idx]
-		#unigrams = nltk.ngrams(tokens, 1)
-		return tokens
+	def _parse_handyman_langmodel_lines(lines):
+		counter = Counter()
+		term_data = []
+		for line in lines:
+			term, _, collection_freq, _ = line.split(' ')
+			term_data.append((term, int(collection_freq)))
+		stemmed_terms = ClarityScore._stem_terms(list(zip(*term_data))[0])
+		for (term, collection_freq), stemmed_term in zip(term_data, stemmed_terms):
+			counter[stemmed_term] += collection_freq
+		return counter
 
-	# Get term counts for a specific document
 	@staticmethod
-	def _file_token_counts(filepath_stem_pair):
-		filepath, stem = filepath_stem_pair
-		with open(filepath, errors='backslashreplace') as fh:
-			try:
-				unigrams = ClarityScore._tokenize(fh.read(), stem)
-			except Exception as e:
-				print("Error encountered when parsing %s" % filepath)
-				raise e
-		#print("Finished tokenizing %s" % filepath)
-		return Counter(unigrams)
+	def _iter_handyman_langmodel_output(filepath):
+		with open(filepath) as fh:
+			line = fh.readline().strip()
+			while not line.startswith("# All following lines: TERM STEMMED_FORM CORPUS_FREQUENCY DOC_FREQUENCY"):
+				line = fh.readline().strip()
+			lines = []
+			for i, line in enumerate(fh):
+				if i > 0 and 0 == i % LINES_CHUNK_SIZE:
+					yield lines
+					lines = []
+				lines.append(line.strip())
+			if len(lines) > 0:
+				yield lines
+
+	@staticmethod
+	def _merge(pair_merge_func, map_func, items, desc):
+		# Create progress logging utilities
+		task_tqdm = tqdm.tqdm(total=len(items) - 1, desc=desc)
+		def update_tqdm_callback(arg):
+			task_tqdm.update()
+			return arg
+
+		# Pair up items to be merged
+		half_len = len(items) // 2
+		unmerged_items = items[2 * half_len:]
+		item_pairs = list(zip(items[:half_len], items[half_len:2 * half_len]))
+		while len(item_pairs) > 0:
+			# Sum pairs and generate a new list of items to be merged
+			items = list(map(update_tqdm_callback, map_func(pair_merge_func, item_pairs))) + \
+					   unmerged_items
+			# Pair up items to be merged
+			half_len = len(items) // 2
+			unmerged_items = items[2 * half_len:]
+			item_pairs = list(zip(items[:half_len], items[half_len:2 * half_len]))
+		return unmerged_items[0]
 
 	@staticmethod
 	def _counter_add(counter_pair):
 		c1, c2 = counter_pair
 		return c1 + c2
 
-	def gen_language_model(self, document_filepaths, stem_tokens=True, desc="LM"):
-		#print("gen_language_model:", document_filepaths, stem_tokens)
-
-		def merge_counters(map_func, counters):
-			# Create progress logging utilities
-			task_tqdm = tqdm.tqdm(total=len(document_counters) - 1, desc="%s Counter Accumulation" % desc)
-			def update_tqdm_callback(arg):
-				task_tqdm.update()
-				return arg
-
-			# Pair up counters to be summed
-			half_len = len(counters) // 2
-			unsummed_counters = counters[2 * half_len:]
-			counter_pairs = list(zip(counters[:half_len], counters[half_len:2 * half_len]))
-			while len(counter_pairs) > 0:
-				# Sum pairs and generate a new list of counters to be summed
-				counters = list(map(update_tqdm_callback, map_func(ClarityScore._counter_add, counter_pairs))) + \
-						   unsummed_counters
-				# Pair up counters to be summed
-				half_len = len(counters) // 2
-				unsummed_counters = counters[2 * half_len:]
-				counter_pairs = list(zip(counters[:half_len], counters[half_len:2 * half_len]))
-			return unsummed_counters[0]
+	@staticmethod
+	def gen_language_model(argspack): # There's no multiprocessing.Pool.startimap
+		tokencounts_filepath, workers, desc = argspack
+		#def merge_counters(map_func, counters):
+		#	# Create progress logging utilities
+		#	task_tqdm = tqdm.tqdm(total=len(counters) - 1, desc="%s Counter Accumulation" % desc)
+		#	def update_tqdm_callback(arg):
+		#		task_tqdm.update()
+		#		return arg
+		#
+		#	# Pair up counters to be summed
+		#	half_len = len(counters) // 2
+		#	unsummed_counters = counters[2 * half_len:]
+		#	counter_pairs = list(zip(counters[:half_len], counters[half_len:2 * half_len]))
+		#	while len(counter_pairs) > 0:
+		#		# Sum pairs and generate a new list of counters to be summed
+		#		counters = list(map(update_tqdm_callback, map_func(ClarityScore._counter_add, counter_pairs))) + \
+		#				   unsummed_counters
+		#		# Pair up counters to be summed
+		#		half_len = len(counters) // 2
+		#		unsummed_counters = counters[2 * half_len:]
+		#		counter_pairs = list(zip(counters[:half_len], counters[half_len:2 * half_len]))
+		#	return unsummed_counters[0]
 
 		# Get term count for each document in collection
-		workers = min(self.workers, len(document_filepaths))
-		tokenizing_desc = "%s Document Tokenizing" % desc
+		tokenizing_desc = "%s Token Counting" % desc
+		merging_desc = "%s Counter Accumulation" % desc
 		if workers > 1:
 			with multiprocessing.Pool(workers) as pool:
-				document_counters = list(tqdm.tqdm(pool.imap(ClarityScore._file_token_counts,
-							[(d, stem_tokens) for d in document_filepaths]),
-						total=len(document_filepaths), desc=tokenizing_desc))
+				counters = list(tqdm.tqdm(pool.imap(ClarityScore._parse_handyman_langmodel_lines,
+							ClarityScore._iter_handyman_langmodel_output(tokencounts_filepath)),
+							desc=tokenizing_desc))
 
 			with multiprocessing.Pool(workers) as pool:
-				counter = merge_counters(pool.imap, document_counters)
+				counter = ClarityScore._merge(ClarityScore._counter_add, pool.imap, counters, desc=merging_desc)
 		else:
-			document_counters = [ClarityScore._file_token_counts((f, stem_tokens)) \
-					for f in tqdm.tqdm(document_filepaths, desc=tokenizing_desc)]
-			counter = merge_counters(map, document_counters)
+			counters = [ClarityScore._parse_handyman_langmodel_lines(lines) \
+					for lines in tqdm.tqdm(ClarityScore._iter_handyman_langmodel_output(tokencounts_filepath), \
+							       desc=tokenizing_desc)]
+			counter = ClarityScore._merge(ClarityScore._counter_add, map, counters, desc=merging_desc)
 
 		# Generate probability distribution from counts by dividing counts
 		# by total number of terms
 		term_count = float(sum(counter.values()))
-		for term in tqdm.tqdm(counter.keys(), desc="%s Count Normalization" % desc):
+		for term in tqdm.tqdm(counter.keys(), desc="%s Token Count Normalization" % desc):
 			counter[term] /= term_count
 		assert(1. - EPSILON <= sum(counter.values()) <= 1. + EPSILON)
 		return counter
 
 
-	def __call__(self, query, docfile_filepath):
-		#print("__call__:", '"'+query+'"', docfile_filepath)
-
+	def __call__(self, query, doc_langmodel_filepaths_file):
 		# Generate lanuage model for each document listed in docfile
 		document_language_models = []
-		for filepath in ClarityScore._parse_docfile(docfile_filepath):
-			document_language_models.append(self.gen_language_model([filepath], desc="Document LM"))
+		with open(doc_langmodel_filepaths_file) as fh, multiprocessing.Pool(self.workers) as pool:
+			for lm in pool.map(ClarityScore.gen_language_model, \
+					map(lambda x: (x.strip(), 1, os.path.basename(x.strip()) + " LM"), fh)):
+				document_language_models.append(lm)
 		#print("document_language_models=", document_language_models)
+		sys.stdout.flush()
+		sys.stderr.flush()
 
-		# Tokenize query
-		query_terms = self._tokenize(query)
-		#print("query_terms=", query_terms)
+		# Stem query
+		# Query is assumed to be in format: "term0","term1",...,"termN"
+		query = query.strip()
+		print(query)
+		assert(len(query) > 0 and query[0] == '"' and query[-1] == '"')
+
+		# Extract terms from query
+		query_terms = []
+		token_start_idx = 0
+		while True:
+			token_end_idx = query[token_start_idx + 1:].find('"') + token_start_idx + 1
+			query_terms.append(query[token_start_idx + 1: token_end_idx])
+			if token_end_idx == len(query) - 1:
+				break
+			else:
+				assert(token_end_idx + 2 < len(query) and \
+				       query[token_end_idx + 1] == ',' and query[token_end_idx + 2] == '"')
+				token_start_idx = token_end_idx + 2
+
+		# Remove emptry string terms
+		query_terms = [term for term in query_terms if len(term) > 0]
+		print("query_terms=", query_terms)
+
+		# Stem terms
+		query_terms = ClarityScore._stem_terms(query_terms)
+		print("stemmed_query_terms=", query_terms)
 
 		# Precompute some values used for computing each of P(w|Q)
 		values_for_P_of_w_given_Q = self._values_for_P_of_w_given_Q(query_terms, document_language_models)
+
+		#https://stackoverflow.com/a/312464/6573510
+		def chunks(lst, n):
+			rval = []
+			"""Yield successive n-sized chunks from lst."""
+			for i in range(0, len(lst), n):
+				#yield lst[i:i + n]
+				rval.append(lst[i:i + n])
+			return rval
 
 		# Compute clarity score term by term
 		#   clarity score = \sum_{w \in V} P(w|Q) log2( P(w|Q) / P_{coll}(w) )
 		#     w: term, V: entire vocabulary of collection, Q: query,
 		#     P(w|Q): query language model function,
 		#     P_{coll}(w): collection language model function,
+		with multiprocessing.Pool(self.workers) as pool:
+			term_contributions = \
+					list(tqdm.tqdm(pool.imap(ClarityScore._compute_terms_contribution,
+								 map(lambda ws: (ws, document_language_models, values_for_P_of_w_given_Q,
+										 self.collection_language_model, self.smoothing_constant),
+								     chunks(list(self.collection_language_model.keys()),
+									    CLARITY_SCORE_TERM_CONTRIB_CHUNK_SIZE))),
+						       desc="Computing Clarity Score Term Contrib",
+						       total=int(math.ceil(len(self.collection_language_model) / CLARITY_SCORE_TERM_CONTRIB_CHUNK_SIZE))))
+		term_contributions = [item for sublist in term_contributions for item in sublist]
+
 		clarity_score = 0.
 		term_info = {}
-		for w in tqdm.tqdm(self.collection_language_model.keys()):
-			P_of_w_given_Q = self._P_of_w_given_Q(w, document_language_models, *values_for_P_of_w_given_Q)
-			P_coll_of_w = self._term_frequency(w, self.collection_language_model)
-			term_contribution = P_of_w_given_Q * math.log2(P_of_w_given_Q / P_coll_of_w)
+		with multiprocessing.Pool(self.workers) as pool:
+			clarity_score, term_info = ClarityScore._merge(ClarityScore._merge_term_contributions, pool.imap,
+					term_contributions, desc="Merging Clarity Score Term Contrib")
+		sys.stdout.flush()
+		sys.stderr.flush()
+		return clarity_score, term_info, query_terms
 
-			term_info[w] = (term_contribution, math.log2(P_of_w_given_Q), math.log2(P_coll_of_w))
-			clarity_score += term_contribution
+	@staticmethod
+	def _merge_term_contributions(argspack):
+		contrib1, contrib2 = argspack
+		partial_clarity_score = contrib1[0] + contrib2[0]
 
-			#print("Clarity Score Term \"%s\" Contribution:" %(w))
-			#print("    log2(P(\"%s\"|Q))=%f" % (w, math.log2(P_of_w_given_Q)))
-			#print("    log2(P_{coll}(%s))=%f" % (w, math.log2(P_coll_of_w)))
-			#print("  P(\"%s\"|Q) log2( P(\"%s\"|Q) / P_{coll}(%s)) =%f" % (w, w, w, term_contribution))
-			#print("")
-		return clarity_score, term_info
+		partial_info = dict()
+		partial_info.update(contrib1[1])
+		partial_info.update(contrib2[1])
+
+		return (partial_clarity_score, partial_info)
 
 
 	def _values_for_P_of_w_given_Q(self, query_terms, document_language_models):
@@ -172,8 +243,9 @@ class ClarityScore(object):
 		assert(1. - EPSILON <= np.sum(priors) <= 1 + EPSILON or 0 == np.sum(priors)) 
 
 		# 2) Compute P(Q|D)s
-		P_of_Q_given_D_list = [self._P_of_Q_given_D(query_terms, doc_lm) \
-							   for doc_lm in document_language_models]
+		P_of_Q_given_D_list = [ClarityScore._P_of_Q_given_D(query_terms, doc_lm,
+				self.collection_language_model, self.smoothing_constant) \
+					for doc_lm in document_language_models]
 		#print("P(Q|D) list -", P_of_Q_given_D_list)
 
 		# 3) Compute [P(Q|D) P(D)]s
@@ -186,16 +258,43 @@ class ClarityScore(object):
 
 		return (P_of_D_given_Q_list, P_of_D_given_Q_sum)
 
+	@staticmethod
+	def _compute_terms_contribution(argspack):
+		ws = argspack[0]
+		return [ClarityScore._compute_term_contribution(w, *argspack[1:]) for w in ws]
 
-	def _P_of_Q_given_D(self, query_terms, document_language_model):
+	@staticmethod
+	def _compute_term_contribution(w, document_language_models, values_for_P_of_w_given_Q, collection_language_model, smoothing_constant):
+		P_of_w_given_Q = ClarityScore._P_of_w_given_Q(w, document_language_models, *values_for_P_of_w_given_Q, \
+				collection_language_model, smoothing_constant)
+		P_coll_of_w = ClarityScore._term_frequency(w, collection_language_model, \
+				collection_language_model, smoothing_constant)
+		term_contribution = P_of_w_given_Q * math.log2(P_of_w_given_Q / P_coll_of_w)
+
+		return (term_contribution, {w: (term_contribution, math.log2(P_of_w_given_Q), math.log2(P_coll_of_w))})
+		#term_info[w] = (term_contribution, math.log2(P_of_w_given_Q), math.log2(P_coll_of_w))
+		#clarity_score += term_contribution
+
+		#print("Clarity Score Term \"%s\" Contribution:" %(w))
+		#print("    log2(P(\"%s\"|Q))=%f" % (w, math.log2(P_of_w_given_Q)))
+		#print("    log2(P_{coll}(%s))=%f" % (w, math.log2(P_coll_of_w)))
+		#print("  P(\"%s\"|Q) log2( P(\"%s\"|Q) / P_{coll}(%s)) =%f" % (w, w, w, term_contribution))
+		#print("")
+
+
+	@staticmethod
+	def _P_of_Q_given_D(query_terms, document_language_model, collection_language_model, smoothing_constant):
 		# P(Q|D) = \prod_{w \in Q} P(w|D)
 		P_of_Q_given_D = 1.
 		for term in query_terms:
-			P_of_Q_given_D *= self._term_frequency(term, document_language_model)
+			P_of_Q_given_D *= ClarityScore._term_frequency(term, document_language_model, \
+					collection_language_model, smoothing_constant)
 		return P_of_Q_given_D
 
 
-	def _P_of_w_given_Q(self, w, document_language_models, P_of_D_given_Q_list, P_of_D_given_Q_sum):
+	@staticmethod
+	def _P_of_w_given_Q(w, document_language_models, P_of_D_given_Q_list, P_of_D_given_Q_sum, \
+			    collection_language_model, smoothing_constant):
 		#print("_P_of_w_given_Q:", '"'+w+'"', query_terms, document_language_models)
 
 		# Estimate query language model function at term w, P(w|Q), term by term
@@ -210,7 +309,8 @@ class ClarityScore(object):
 			#print("Document %d P(\"%s\"|Q)" % (i, w))
 
 			# Compute P(w|D)
-			P_of_w_given_D = self._term_frequency(w, document_language_model)
+			P_of_w_given_D = ClarityScore._term_frequency(w, document_language_model, \
+					collection_language_model, smoothing_constant)
 			#print("    P(\"%s\"|D_%d)=%f" % (w, i, P_of_w_given_D))
 
 			# Compute P(D|Q)
@@ -232,16 +332,17 @@ class ClarityScore(object):
 		return probability
 
 
-	def _term_frequency(self, w, language_model):
+	@staticmethod
+	def _term_frequency(w, language_model, collection_language_model, smoothing_constant):
 		# Compute relative frequeny of term w in language model.
 		# Result is smoothed if langauge model is not the collection
 		# language model.
 		frequency = language_model[w]
-		if language_model is not self.collection_language_model:
+		if language_model is not collection_language_model:
 			# P(w|D) = \lambda P_{ml}(w|D) + (1 - \lambda) P_{coll}(w)
 			# \lambda = 0.6
-			frequency = self.smoothing_constant * frequency + \
-						(1. - self.smoothing_constant) * self.collection_language_model[w]
+			frequency = smoothing_constant * frequency + \
+						(1. - smoothing_constant) * collection_language_model[w]
 		return frequency
 
 	@staticmethod
@@ -274,21 +375,24 @@ class ClarityScore(object):
 
 def main():
 	parser = argparse.ArgumentParser()
-	parser.add_argument('-q', '--query', required=True)
+	parser.add_argument('-q', '--query', required=False)
 
 	group = parser.add_mutually_exclusive_group(required=True)
-	group.add_argument('-L', '--collection_filepath')
+	group.add_argument('-L', '--collection_langmodel_filepath',
+			   help='File should contain output from wumpus\' handyman operation BUILD_LM')
 	group.add_argument('-A', '--cache_input_filepath')
 
-	parser.add_argument('-r', '--retrieval_filepath')
+	parser.add_argument('-r', '--retrieval_langmodel_filepaths_file', required=False,
+			    help='File should contain output from wumpus\' handyman operation BUILD_LM')
 	parser.add_argument('-o', '--cache_output_filepath', required=False)
 	parser.add_argument('--smoothing', default=0.6, type=float, required=False)
 	parser.add_argument('--workers', default=8, type=int, required=False)
 	parser.add_argument('--max_top_terms', default=5, type=int, required=False)
+	parser.add_argument('--augmented_queries', default=0, type=int, required=False)
 	args = parser.parse_args()
 
-	if args.collection_filepath is not None:
-		cs = ClarityScore(args.collection_filepath, smoothing_constant=args.smoothing, workers=args.workers)
+	if args.collection_langmodel_filepath is not None:
+		cs = ClarityScore(args.collection_langmodel_filepath, smoothing_constant=args.smoothing, workers=args.workers)
 	else:
 		cs = ClarityScore.restore(args.cache_input_filepath)
 		cs.workers = args.workers
@@ -296,13 +400,26 @@ def main():
 	if args.cache_output_filepath is not None:
 		cs.save(args.cache_output_filepath)
 
-	clarity_score, term_info = cs(args.query, args.retrieval_filepath)
-	print("Clarity Score: %f" % clarity_score)
-	print("Top Contributing Terms:")
-	top_contributing_terms = sorted(term_info.items(), key=lambda v: -v[1][0])[:min(args.max_top_terms, len(term_info))]
-	for term, (term_contribution, log2_P_of_w_given_Q, log2_P_coll_of_w) in top_contributing_terms:
-		print("  %s: %f" % (str(term), term_contribution))
+	if args.retrieval_langmodel_filepaths_file is not None:
+		clarity_score, term_info, stemmed_query_terms = cs(args.query, args.retrieval_langmodel_filepaths_file)
+		print("Clarity Score=%f" % clarity_score)
+		print("Top Contributing Terms:")
+		sorted_contributing_terms = sorted(term_info.items(), key=lambda v: -v[1][0])
+		top_contributing_terms = sorted_contributing_terms[:min(args.max_top_terms, len(term_info))]
+		for term, (term_contribution, log2_P_of_w_given_Q, log2_P_coll_of_w) in top_contributing_terms:
+			print("  %s: %f" % (str(term), term_contribution))
 
+		if args.augmented_queries > 0:
+			augmented_query = args.query
+			added_terms = 0
+
+			for term, _ in sorted_contributing_terms:
+				if term not in stemmed_query_terms:
+					augmented_query += ',"%s"' % term
+					added_terms += 1
+					print("Augmented Query %d=%s" % (added_terms, augmented_query))
+					if added_terms == args.augmented_queries:
+						break
 
 if __name__ == "__main__":
 	main()
