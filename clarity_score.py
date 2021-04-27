@@ -14,6 +14,10 @@ LINES_CHUNK_SIZE=1000
 CLARITY_SCORE_TERM_CONTRIB_CHUNK_SIZE = 10000
 EPSILON = 1e-10
 
+class BadTermError(RuntimeError):
+	def __init__(self, term):
+		self.term = term
+
 class ClarityScore(object):
 	def __init__(self, collection_filepath, smoothing_constant=0.6, workers=8):
 		self.smoothing_constant = smoothing_constant
@@ -156,7 +160,7 @@ class ClarityScore(object):
 		# Stem query
 		# Query is assumed to be in format: "term0","term1",...,"termN"
 		query = query.strip()
-		print(query)
+		#print(query)
 		assert(len(query) > 0 and query[0] == '"' and query[-1] == '"')
 
 		# Extract terms from query
@@ -172,16 +176,31 @@ class ClarityScore(object):
 				       query[token_end_idx + 1] == ',' and query[token_end_idx + 2] == '"')
 				token_start_idx = token_end_idx + 2
 
-		# Remove emptry string terms
-		query_terms = [term for term in query_terms if len(term) > 0]
-		print("query_terms=", query_terms)
-
 		# Stem terms
 		query_terms = ClarityScore._stem_terms(query_terms)
 		print("stemmed_query_terms=", query_terms)
 
+		# Remove emptry string terms
+		query_terms = [term for term in query_terms if len(term) > 0]
+		print("query_terms=", query_terms)
+
 		# Precompute some values used for computing each of P(w|Q)
-		values_for_P_of_w_given_Q = self._values_for_P_of_w_given_Q(query_terms, document_language_models)
+		while True:
+			try:
+				values_for_P_of_w_given_Q = self._values_for_P_of_w_given_Q(query_terms, document_language_models)
+				break
+			except BadTermError as e:
+				idx = query_terms.index(e.term)
+				print("Bad Term '%s'!" % e.term)
+				if ' ' in e.term:
+					print("  Splitting spaces and retrying")
+					query_terms.pop(idx)
+					for subterm in reversed(e.term.split(' ')):
+						query_terms.insert(idx, subterm)
+				else:
+					print("  Removing from query")
+					query_terms.pop(idx)
+				print("Updated Query: %s" % ','.join(query_terms))
 
 		#https://stackoverflow.com/a/312464/6573510
 		def chunks(lst, n):
@@ -232,12 +251,7 @@ class ClarityScore(object):
 	def _values_for_P_of_w_given_Q(self, query_terms, document_language_models):
 		# Precompute [P(Q|D) P(D)]s for each document for computation of P(D|Q)
 		# 1) Compute priors, P(D)s
-		priors = np.array([0.] * len(document_language_models))
-		for i, lm in enumerate(document_language_models):
-			for term in query_terms:
-				if term in lm:
-					priors[i] = 1.
-					break
+		priors = np.array([1.] * len(document_language_models))
 		priors = priors / np.sum(priors)
 		#print("priors -", priors)
 		assert(1. - EPSILON <= np.sum(priors) <= 1 + EPSILON or 0 == np.sum(priors)) 
@@ -285,10 +299,16 @@ class ClarityScore(object):
 	@staticmethod
 	def _P_of_Q_given_D(query_terms, document_language_model, collection_language_model, smoothing_constant):
 		# P(Q|D) = \prod_{w \in Q} P(w|D)
+		#print("Computing P(Q|D)")
 		P_of_Q_given_D = 1.
 		for term in query_terms:
-			P_of_Q_given_D *= ClarityScore._term_frequency(term, document_language_model, \
+			term_frequency = ClarityScore._term_frequency(term, document_language_model, \
 					collection_language_model, smoothing_constant)
+			if 0 == term_frequency:
+				raise BadTermError(term)
+			#print("  tf(%s) =" % term, term_frequency)
+			P_of_Q_given_D *= term_frequency
+			#print("  P_of_Q_given_D=%f" % P_of_Q_given_D)
 		return P_of_Q_given_D
 
 
