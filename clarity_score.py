@@ -9,10 +9,10 @@ from collections import Counter
 import argparse
 import tqdm
 import subprocess
+from fractions import Fraction
 
 LINES_CHUNK_SIZE=1000
 CLARITY_SCORE_TERM_CONTRIB_CHUNK_SIZE = 10000
-EPSILON = 1e-10
 
 class BadTermError(RuntimeError):
 	def __init__(self, term):
@@ -20,7 +20,7 @@ class BadTermError(RuntimeError):
 
 class ClarityScore(object):
 	def __init__(self, collection_filepath, smoothing_constant=0.6, workers=8):
-		self.smoothing_constant = smoothing_constant
+		self.smoothing_constant = Fraction(smoothing_constant)
 		self.workers = workers
 
 		# I only really want restore passing None to constructor
@@ -139,10 +139,10 @@ class ClarityScore(object):
 
 		# Generate probability distribution from counts by dividing counts
 		# by total number of terms
-		term_count = float(sum(counter.values()))
+		term_count = sum(counter.values())
 		for term in tqdm.tqdm(counter.keys(), desc="%s Token Count Normalization" % desc):
-			counter[term] /= term_count
-		assert(1. - EPSILON <= sum(counter.values()) <= 1. + EPSILON)
+			counter[term] = Fraction(counter[term], term_count)
+		assert(sum(counter.values()) == 1)
 		return counter
 
 
@@ -160,7 +160,7 @@ class ClarityScore(object):
 		# Stem query
 		# Query is assumed to be in format: "term0","term1",...,"termN"
 		query = query.strip()
-		#print(query)
+		print(query)
 		assert(len(query) > 0 and query[0] == '"' and query[-1] == '"')
 
 		# Extract terms from query
@@ -227,7 +227,6 @@ class ClarityScore(object):
 						       total=int(math.ceil(len(self.collection_language_model) / CLARITY_SCORE_TERM_CONTRIB_CHUNK_SIZE))))
 		term_contributions = [item for sublist in term_contributions for item in sublist]
 
-		clarity_score = 0.
 		term_info = {}
 		with multiprocessing.Pool(self.workers) as pool:
 			clarity_score, term_info = ClarityScore._merge(ClarityScore._merge_term_contributions, pool.imap,
@@ -251,10 +250,9 @@ class ClarityScore(object):
 	def _values_for_P_of_w_given_Q(self, query_terms, document_language_models):
 		# Precompute [P(Q|D) P(D)]s for each document for computation of P(D|Q)
 		# 1) Compute priors, P(D)s
-		priors = np.array([1.] * len(document_language_models))
-		priors = priors / np.sum(priors)
+		priors = [Fraction(1, len(document_language_models))] * len(document_language_models)
 		#print("priors -", priors)
-		assert(1. - EPSILON <= np.sum(priors) <= 1 + EPSILON or 0 == np.sum(priors)) 
+		assert(sum(priors) == 1)
 
 		# 2) Compute P(Q|D)s
 		P_of_Q_given_D_list = [ClarityScore._P_of_Q_given_D(query_terms, doc_lm,
@@ -283,6 +281,11 @@ class ClarityScore(object):
 				collection_language_model, smoothing_constant)
 		P_coll_of_w = ClarityScore._term_frequency(w, collection_language_model, \
 				collection_language_model, smoothing_constant)
+
+		# At this point in the code, all values used to compute the term contribution should be Python Fractions
+		assert(isinstance(P_of_w_given_Q, Fraction) and isinstance(P_coll_of_w, Fraction))
+		# Because of the operations performed, the term contribution will have type float
+
 		term_contribution = P_of_w_given_Q * math.log2(P_of_w_given_Q / P_coll_of_w)
 
 		return (term_contribution, {w: (term_contribution, math.log2(P_of_w_given_Q), math.log2(P_coll_of_w))})
@@ -290,9 +293,9 @@ class ClarityScore(object):
 		#clarity_score += term_contribution
 
 		#print("Clarity Score Term \"%s\" Contribution:" %(w))
-		#print("    log2(P(\"%s\"|Q))=%f" % (w, math.log2(P_of_w_given_Q)))
-		#print("    log2(P_{coll}(%s))=%f" % (w, math.log2(P_coll_of_w)))
-		#print("  P(\"%s\"|Q) log2( P(\"%s\"|Q) / P_{coll}(%s)) =%f" % (w, w, w, term_contribution))
+		#print("    log2(P(\"%s\"|Q))=" % w, math.log2(P_of_w_given_Q))
+		#print("    log2(P_{coll}(%s))=" % w, math.log2(P_coll_of_w))
+		#print("  P(\"%s\"|Q) log2( P(\"%s\"|Q) / P_{coll}(%s)) =" % (w, w, w), term_contribution)
 		#print("")
 
 
@@ -300,7 +303,7 @@ class ClarityScore(object):
 	def _P_of_Q_given_D(query_terms, document_language_model, collection_language_model, smoothing_constant):
 		# P(Q|D) = \prod_{w \in Q} P(w|D)
 		#print("Computing P(Q|D)")
-		P_of_Q_given_D = 1.
+		P_of_Q_given_D = Fraction(1.)
 		for term in query_terms:
 			term_frequency = ClarityScore._term_frequency(term, document_language_model, \
 					collection_language_model, smoothing_constant)
@@ -308,7 +311,7 @@ class ClarityScore(object):
 				raise BadTermError(term)
 			#print("  tf(%s) =" % term, term_frequency)
 			P_of_Q_given_D *= term_frequency
-			#print("  P_of_Q_given_D=%f" % P_of_Q_given_D)
+			#print("  P_of_Q_given_D=", P_of_Q_given_D)
 		return P_of_Q_given_D
 
 
@@ -324,14 +327,14 @@ class ClarityScore(object):
 		#     R: set of containing at least one query term (documents retrieved),
 		#     P(w|D): frequency of term w in document D,
 		#     P(D|Q): probability of document D given query Q
-		probability = 0.
+		probability = Fraction(0)
 		for i, (P_of_D_given_Q, document_language_model) in enumerate(zip(P_of_D_given_Q_list, document_language_models)):
 			#print("Document %d P(\"%s\"|Q)" % (i, w))
 
 			# Compute P(w|D)
 			P_of_w_given_D = ClarityScore._term_frequency(w, document_language_model, \
 					collection_language_model, smoothing_constant)
-			#print("    P(\"%s\"|D_%d)=%f" % (w, i, P_of_w_given_D))
+			#print("    P(\"%s\"|D_%d)=" % (w, i), P_of_w_given_D)
 
 			# Compute P(D|Q)
 			#   P(D|Q) is derived from P(Q|D) using Bayesian inverse with
@@ -343,10 +346,10 @@ class ClarityScore(object):
 			#
 			# see Estimating the Query Difficulty for Information Retrieval
 			P_of_D_given_Q = P_of_D_given_Q / P_of_D_given_Q_sum
-			#print("    P(D_%d|Q)=%f" % (i, P_of_D_given_Q))
+			#print("    P(D_%d|Q)=" % i, P_of_D_given_Q)
 
 			term_contribution = P_of_w_given_D * P_of_D_given_Q
-			#print("  P(\"%s\"|Q)=%f" % (w, term_contribution))
+			#print("  P(\"%s\"|Q)=" % w, term_contribution)
 
 			probability += term_contribution
 		return probability
@@ -362,7 +365,7 @@ class ClarityScore(object):
 			# P(w|D) = \lambda P_{ml}(w|D) + (1 - \lambda) P_{coll}(w)
 			# \lambda = 0.6
 			frequency = smoothing_constant * frequency + \
-						(1. - smoothing_constant) * collection_language_model[w]
+						(1- smoothing_constant) * collection_language_model[w]
 		return frequency
 
 	@staticmethod
@@ -422,12 +425,12 @@ def main():
 
 	if args.retrieval_langmodel_filepaths_file is not None:
 		clarity_score, term_info, stemmed_query_terms = cs(args.query, args.retrieval_langmodel_filepaths_file)
-		print("Clarity Score=%f" % clarity_score)
+		print("Clarity Score=", clarity_score)
 		print("Top Contributing Terms:")
 		sorted_contributing_terms = sorted(term_info.items(), key=lambda v: -v[1][0])
 		top_contributing_terms = sorted_contributing_terms[:min(args.max_top_terms, len(term_info))]
 		for term, (term_contribution, log2_P_of_w_given_Q, log2_P_coll_of_w) in top_contributing_terms:
-			print("  %s: %f" % (str(term), term_contribution))
+			print("  %s:" % str(term), term_contribution)
 
 		if args.augmented_queries > 0:
 			augmented_query = args.query
